@@ -40,7 +40,7 @@ public class Main {
     public static void main(String[] args) throws IOException {
         Logger.getLogger("org").setLevel(Level.FATAL);
 
-
+        System.out.println("hello");
         if (args[0].equals("--concat")) {
             String year = args[1].substring(0, 2);
             String month = args[1].substring(2, 4);
