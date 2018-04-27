@@ -1,6 +1,7 @@
-import POJO.Recommendation;
 import POJO.Transaction;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mongodb.spark.MongoSpark;
+import com.mongodb.spark.config.WriteConfig;
 import org.apache.commons.collections.map.HashedMap;
 import org.apache.log4j.Level;
 import org.apache.log4j.Logger;
@@ -11,9 +12,6 @@ import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.ml.recommendation.ALS;
 import org.apache.spark.ml.recommendation.ALSModel;
 import org.apache.spark.sql.*;
-import org.apache.spark.sql.types.DataTypes;
-import org.apache.spark.sql.types.StructField;
-import org.apache.spark.sql.types.StructType;
 import org.bson.Document;
 
 import java.io.*;
@@ -21,7 +19,6 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 
 import static java.lang.System.currentTimeMillis;
-import static org.apache.spark.sql.types.DataTypes.StringType;
 
 public class Main {
     private static int MIN_VALUE_RATING = 1;
@@ -30,18 +27,19 @@ public class Main {
     private static JavaSparkContext javaSparkContext;
     private static SparkSession sparkSession;
     private static String FILE_TYPE = ".log";
+    private static String collectionRecommendations = "userRecommendations";
     private static String collectionStoreName = "userStoreRecommendations";
+    private static String collectionOrganizationName = "userOrganizationRecommendations";
     private static String databaseName = "recommendationDB";
-    //private static String homeFolder = "C:/Users/Jonna/OneDrive/Skrivbord/";
-    private static String homeFolder = "C:/Users/Anton/Desktop/";
+    private static String homeFolder = "C:/Users/Jonna/OneDrive/Skrivbord/";
+    //private static String homeFolder = "C:/Users/Anton/Desktop/";
+    //private static String homeFolder = "/home/jonna/Desktop/";
     private static String rootLogFolder = "/Logs/v1";
 
 
     public static void main(String[] args) throws IOException {
         Logger.getLogger("org").setLevel(Level.FATAL);
 
-        System.out.println("hello");
-        
         if (args[0].equals("--concat")) {
             String year = args[1].substring(0, 2);
             String month = args[1].substring(2, 4);
@@ -52,11 +50,11 @@ public class Main {
             build(args[1]);
 
         } else if (args[0].equals("--parseDefault")) {
-            parseCreateRatings(args[1], true, true);
+            parseCreateRatings(args[1]);
         } else if (args[0].equals("--parse")) {
-            parseCreateRatings(args[1], false, true);
+            parseCreateRatings(args[1]);
         } else if (args[0].equals("--model")) {
-            createModel(args[1], true);
+            createModels(args[1]);
         } else if (args[0].equals("--test")) {
             test(homeFolder + args[1] + FILE_TYPE);
         }
@@ -109,10 +107,9 @@ public class Main {
         modelTest(transactions);
 
 
-
     }
 
-    private static void modelTest(JavaRDD<Transaction> transactions){
+    private static void modelTest(JavaRDD<Transaction> transactions) {
 
 
         // Apply a schema to an RDD of JavaBeans to get a DataFrame
@@ -127,14 +124,7 @@ public class Main {
 
     }
 
-    private static void build(String inputFile) {
-        System.out.println("Parsing...");
-        JavaRDD<Transaction> transactionRatings = parseCreateRatings(inputFile, false, false);
-        System.out.println("Building model...");
-        createModel(inputFile, false);
-
-    }
-
+    // Takes an input folder, reads all the events and concatenate them into a single file (monthly events)
     private static void concatFiles(String inputFolder, String outputFolder) throws IOException {
         conf = new SparkConf().setMaster("local[100]")
                 .setAppName("Parsing");
@@ -154,17 +144,24 @@ public class Main {
         writer.close();
     }
 
-    private static JavaRDD<Transaction> parseCreateRatings(String inputArg, boolean defaultRating, boolean testing) {
-        String inputFile = homeFolder + inputArg + FILE_TYPE;
-        String outputFile;
-        if (defaultRating) {
-            outputFile = homeFolder + inputArg + "ratingsDefault" + FILE_TYPE;
-        } else {
-            outputFile = homeFolder + inputArg + "ratings" + FILE_TYPE;
-        }
+    /*
+     * Reads the events given a certain input file
+     * Create ratings
+     * Builds the model and recommendations
+     * Inserts into mongoDB
+     */
+    private static void build(String inputFile) {
+        String transactionRatingFileName = parseCreateRatings(inputFile);
+        createModels(transactionRatingFileName);
+    }
 
+    // Reads events from a file and create ratings from 1-5
+    private static String parseCreateRatings(String inputArg) {
+        String inputFile = homeFolder + inputArg + FILE_TYPE;
+        String outputFile = homeFolder + inputArg + "ratings" + FILE_TYPE;
 
         System.out.println("Parsing JSON data from file...");
+
         conf = new SparkConf()
                 .setMaster("local[100]")
                 .setAppName("Parsing");
@@ -181,100 +178,76 @@ public class Main {
                 .filter(t -> t.getBaseConsumer() != null && t.getProductId() != 0);
 
 
-        // ObjectMapper mapper = new ObjectMapper();
+        // Get all transactions made by each consumer
+        JavaPairRDD<Integer, Iterable<Transaction>> transactionsConsumers = transactions
+                .groupBy(t -> t.getBaseConsumer().getConsumerId());
 
-        if (!defaultRating) {
-            JavaPairRDD<Integer, Iterable<Transaction>> transactionsConsumers = transactions
-                    .groupBy(t -> t.getBaseConsumer().getConsumerId());
+        // Get all transactions made for each product
+        JavaPairRDD<Long, Iterable<Transaction>> transactionsProducts = transactions
+                .groupBy(t -> t.getProductId());
 
-            JavaPairRDD<Long, Iterable<Transaction>> transactionsProducts = transactions
-                    .groupBy(t -> t.getProductId());
+        Map<Integer, Iterable<Transaction>> consumerTransactions = transactionsConsumers.collectAsMap();
+        Map<Long, Iterable<Transaction>> productTransactions = transactionsProducts.collectAsMap();
+        Map<Long, List<Double>> APproduct = new HashedMap();
 
-            Map<Integer, Iterable<Transaction>> consumerTransactions = transactionsConsumers.collectAsMap();
-            Map<Long, Iterable<Transaction>> productTransactions = transactionsProducts.collectAsMap();
-            Map<Long, List<Double>> APproduct = new HashedMap();
+        transactions.foreach(transaction -> {
+            int rating;
+            // Check if a product has been deleted, if so, the rating is set to 1 (minimum rating)
+            if (transaction.getOrderElementChangeType() != null && transaction.getOrderElementChangeType().equals("DELETION")) {
+                rating = MIN_VALUE_RATING;
+            } else {
+                int currentConsumer = transaction.getBaseConsumer().getConsumerId();
 
-            transactions.foreach(transaction -> {
-                int rating;
-                if (transaction.getOrderElementChangeType() != null && transaction.getOrderElementChangeType().equals("DELETION")) {
-                    rating = MIN_VALUE_RATING;
+                // Get total amount of product bought by the current customer
+                int totalBoughtProducts = ((Collection<?>) consumerTransactions.get(transaction.getBaseConsumer().getConsumerId())).size();
+                int boughtProduct = 0;
+
+                // Get the consumer transactions for the current product
+                for (Transaction boughtProductTransaction : productTransactions.get(transaction.getProductId())) {
+                    // Check if the product has been bought by the current consumer
+                    if (currentConsumer == boughtProductTransaction.getBaseConsumer().getConsumerId()) {
+                        boughtProduct++;
+                    }
+                }
+
+                double AP = Math.log(((double) boughtProduct / (double) totalBoughtProducts) + 1);
+                double maxAP = 0;
+
+                // Check if AP for the product exists
+                if (APproduct.containsKey(transaction.getProductId())) {
+                    APproduct.get(transaction.getProductId()).add(AP);
+                    maxAP = Collections.max(APproduct.get(transaction.getProductId()));
                 } else {
-                    int currentConsumer = transaction.getBaseConsumer().getConsumerId();
-
-                    // Get total amount of product bought by the current customer
-                    int totalBoughtProducts = ((Collection<?>) consumerTransactions.get(transaction.getBaseConsumer().getConsumerId())).size();
-                    int boughtProduct = 0;
-
-                    // Get the consumer transactions for the current product
-                    for (Transaction boughtProductTransaction : productTransactions.get(transaction.getProductId())) {
-                        // Check if the product has been bought by the current consumer
-                        if (currentConsumer == boughtProductTransaction.getBaseConsumer().getConsumerId()) {
-                            boughtProduct++;
-                        }
-                    }
-
-                    double AP = Math.log(((double) boughtProduct / (double) totalBoughtProducts) + 1);
-                    double maxAP = 0;
-
-                    // Check if AP for the product exists
-                    if (APproduct.containsKey(transaction.getProductId())) {
-                        APproduct.get(transaction.getProductId()).add(AP);
-                        maxAP = Collections.max(APproduct.get(transaction.getProductId()));
-                    } else {
-                        ArrayList<Double> APs = new ArrayList<>();
-                        APs.add(AP);
-                        APproduct.put(transaction.getProductId(), APs);
-                        maxAP = AP;
-                    }
-
-
-                    float RP = (float) AP / (float) maxAP;
-                    rating = (int) Math.ceil(5 * RP);
+                    ArrayList<Double> APs = new ArrayList<>();
+                    APs.add(AP);
+                    APproduct.put(transaction.getProductId(), APs);
+                    maxAP = AP;
                 }
 
-                transaction.getBaseConsumer().setRating(rating);
 
-                if (testing) {
-                    //BufferedWriter writer = new BufferedWriter
-                    //       (new OutputStreamWriter(new FileOutputStream(outputFile, true), StandardCharsets.ISO_8859_1));
-                    //writer.append(mapper.writeValueAsString(transaction) + "\n");
-                    //writer.close();
-                }
-            });
+                float RP = (float) AP / (float) maxAP;
+                rating = (int) Math.ceil(5 * RP);
+            }
 
+            transaction.getBaseConsumer().setRating(rating);
 
-        } else {
-            transactions.foreach(transaction -> {
-                int rating;
-                if (transaction.getOrderElementChangeType().equals("DELETION")) {
-                    rating = MIN_VALUE_RATING;
-                } else {
-                    rating = MAX_VALUE_RATING;
+            writeToFile(outputFile, transaction);
+        });
 
-                    transaction.getBaseConsumer().setRating(rating);
-
-                    if (testing) {
-                        //BufferedWriter writer = new BufferedWriter
-                        //       (new OutputStreamWriter(new FileOutputStream(outputFile, true), StandardCharsets.ISO_8859_1));
-                        //writer.append(mapper.writeValueAsString(transaction) + "\n");
-                        //writer.close();
-                    }
-                }
-            });
-        }
 
         System.out.println("Done parsing.");
-        System.out.println(transactions.count());
-        return transactions;
+        return outputFile;
     }
 
-    private static void createModel(String inputEvents, boolean testing) {
-        String modelFolder = homeFolder + inputEvents + "model";
+    // Create recommendations based on all transactions
+    private static void createModels(String inputEvents) {
         String eventsRating = homeFolder + inputEvents + FILE_TYPE;
 
         conf = new SparkConf()
-                .set("spark.mongodb.input.uri", "mongodb://127.0.0.1/" + databaseName + "." + collectionStoreName)
-                .setMaster("local[100]")
+                .set("spark.mongodb.output.uri", "mongodb://127.0.0.1/" + databaseName + "." + collectionStoreName)
+                .set("spark.mongodb.output.uri", "mongodb://127.0.0.1/" + databaseName + "." + collectionOrganizationName)
+                .set("spark.mongodb.output.uri", "mongodb://127.0.0.1/" + databaseName + "." + collectionRecommendations)
+                .setMaster("local[*]")
                 .setAppName("Model");
 
         javaSparkContext = new JavaSparkContext(conf);
@@ -284,13 +257,23 @@ public class Main {
                 .config(conf)
                 .getOrCreate();
 
+        // Read the events with ratings
         Dataset<Row> events = sparkSession.read().json(eventsRating);
-
-        events.printSchema();
 
         events.createOrReplaceTempView("events");
 
+        Dataset<Row> organizationIds = sparkSession.sql("SELECT DISTINCT organizationId FROM events");
 
+        System.out.println("Building recommendations based on organizations:");
+        organizationIds.foreach(r -> {
+            long organizationId = (long) r.get(0);
+            Dataset<Row> transactionsOrganization = sparkSession.sql("SELECT baseConsumer.consumerId, baseConsumer.rating, productId FROM events WHERE organizationId = " + organizationId);
+            createModelOrganization(transactionsOrganization, organizationId);
+        });
+
+        /*
+
+        long start = currentTimeMillis();
         Dataset<Row> transactions = sparkSession.sql("SELECT baseConsumer.consumerId, baseConsumer.rating, productId FROM events");
 
         double[] splitPercantage = {0.8, 0.2};
@@ -315,88 +298,73 @@ public class Main {
         Dataset<Row> consumerRecommends = model.recommendForAllUsers(10);
 
 
-
         System.out.println("num of users: " + consumerRecommends.count());
 
+        long end = currentTimeMillis();
+
+        long elapsedTime = end - start;
+
+        System.out.println("Took " + elapsedTime);
 
         JavaRDD<Document> recommendations = consumerRecommends.toJSON()
                 .toJavaRDD()
                 .map(Transaction::convertToDocument).cache();
-
-        recommendations.foreach(document -> {
-            document.append("storeId", 1);
-        });
-
-
-        MongoSpark.save(recommendations);
-        System.out.println("Saved recommendations in database");
-
-    }
-
-    private static void createModelOrganization(JavaRDD<Transaction> allTransactions, int organizationId, boolean testing) {
-        conf = new SparkConf()
-                .set("spark.mongodb.input.uri", "mongodb://127.0.0.1/" + databaseName + "." + collectionStoreName)
-                .setMaster("local[100]")
-                .setAppName("Model");
-
-
-/*
-
-        StructType schema = DataTypes.createStructType(Arrays.asList(
-                DataTypes.createStructField("baseConsumer", DataTypes.createStructType(Arrays.asList(
-                        DataTypes.createStructField("consumerId", DataTypes.LongType, true),
-                        DataTypes.createStructField("consumerLoyaltyChangeState", DataTypes.StringType, true),
-                        DataTypes.createStructField("consumerLoyaltyState", DataTypes.StringType, true),
-                        DataTypes.createStructField("consumerPhase", DataTypes.StringType, true),
-                        DataTypes.createStructField("rating", DataTypes.LongType, true)
-                )), true),
-                DataTypes.createStructField("campaignId", DataTypes.LongType, true),
-                DataTypes.createStructField("currency", DataTypes.StringType, true),
-                DataTypes.createStructField("discount", DataTypes.LongType, true),
-                DataTypes.createStructField("eventDateBlock", DataTypes.createStructType(Arrays.asList(
-                        DataTypes.createStructField("epochMilli", DataTypes.LongType, true),
-                        DataTypes.createStructField("hour", DataTypes.LongType, true),
-                        DataTypes.createStructField("localDateTime", DataTypes.LongType, true),
-                        DataTypes.createStructField("month", DataTypes.StringType, true),
-                        DataTypes.createStructField("quarter", DataTypes.LongType, true),
-                        DataTypes.createStructField("timeOfDay", DataTypes.StringType, true),
-                        DataTypes.createStructField("week", DataTypes.LongType, true),
-                        DataTypes.createStructField("weekDay", DataTypes.LongType, true),
-                        DataTypes.createStructField("year", DataTypes.LongType, true)
-                )), true),
-                DataTypes.createStructField("eventId", DataTypes.StringType, true),
-                DataTypes.createStructField("eventType", DataTypes.StringType, true),
-                DataTypes.createStructField("externalId", DataTypes.StringType, true),
-                DataTypes.createStructField("orderElementChangeType", DataTypes.StringType, true),
-                DataTypes.createStructField("orderElementName", DataTypes.StringType, true),
-                DataTypes.createStructField("orderElementType", DataTypes.StringType, true),
-                DataTypes.createStructField("orderExternalId", DataTypes.StringType, true),
-                DataTypes.createStructField("orderId", DataTypes.LongType, true),
-                DataTypes.createStructField("organizationId", DataTypes.LongType, true),
-                DataTypes.createStructField("organizationName", DataTypes.StringType, true),
-                DataTypes.createStructField("paymentType", DataTypes.StringType, true),
-                DataTypes.createStructField("price", DataTypes.LongType, true),
-                DataTypes.createStructField("productId", DataTypes.LongType, true),
-                DataTypes.createStructField("productOptionGroupId", DataTypes.LongType, true),
-                DataTypes.createStructField("storeId", DataTypes.LongType, true),
-                DataTypes.createStructField("storeLocationCity", DataTypes.StringType, true),
-                DataTypes.createStructField("storeName", DataTypes.StringType, true)
-        ));
 
 */
 
+    }
 
-        Dataset<Row> events = sparkSession.createDataFrame(allTransactions, Transaction.class).toDF();
-
-
-
-        events.createOrReplaceTempView("events");
-
-        Dataset<Row> transactions = sparkSession.sql("SELECT baseConsumer.consumerId, baseConsumer.rating, productId FROM events");
+    private static void createModelOrganization(Dataset<Row> transactionsOrganization, long organizationId) {
+        long start = currentTimeMillis();
 
         double[] splitPercantage = {0.8, 0.2};
-        Dataset<Row> trainingDs = transactions.randomSplit(splitPercantage)[0];
-        Dataset<Row> testDs = transactions.randomSplit(splitPercantage)[1];
+        Dataset<Row> trainingDs = transactionsOrganization.randomSplit(splitPercantage)[0];
+        Dataset<Row> testDs = transactionsOrganization.randomSplit(splitPercantage)[1];
+
+
+        ALS als = new ALS()
+                .setMaxIter(5)
+                .setRegParam(0.01)
+                .setUserCol("consumerId")
+                .setRatingCol("rating")
+                .setItemCol("productId");
+
+
+        // Train a model from the dataset (this could be using whole dataset as well if needed)
+        ALSModel model = als.fit(trainingDs);
+
+        // Future work, to measure accuracy for the model
+        Dataset<Row> predictions = model.transform(testDs);
+
+        // 10 item recommendations for each consumer
+        Dataset<Row> consumerRecommends = model.recommendForAllUsers(10);
+
+
+        System.out.println("num of users: " + consumerRecommends.count());
+
+        long end = currentTimeMillis();
+
+        long elapsedTime = end - start;
+
+        System.out.println("[createModelOrganization] - elapsed time " + elapsedTime);
+
+        JavaRDD<Document> recommendations = consumerRecommends.toJSON()
+                .toJavaRDD()
+                .map(Transaction::convertToDocument).cache();
+        recommendations.foreach(document -> {
+            // Maybee the cast is not needed (mongodb stores the value as NumberLong(1))
+            document.append("organizationId", (int) organizationId);
+        });
+
+        writeToDatabase(recommendations, collectionOrganizationName);
+    }
+
+    private static void createModelStore(Dataset<Row> transactionsOrganization, int organizationId) {
+        long start = currentTimeMillis();
+
+        double[] splitPercantage = {0.8, 0.2};
+        Dataset<Row> trainingDs = transactionsOrganization.randomSplit(splitPercantage)[0];
+        Dataset<Row> testDs = transactionsOrganization.randomSplit(splitPercantage)[1];
 
 
         ALS als = new ALS()
@@ -418,47 +386,44 @@ public class Main {
 
         System.out.println("num of users: " + consumerRecommends.count());
 
+        long end = currentTimeMillis();
+
+        long elapsedTime = end - start;
+
+        System.out.println("[createModelOrganization] - elapsed time " + elapsedTime);
 
         JavaRDD<Document> recommendations = consumerRecommends.toJSON()
                 .toJavaRDD()
                 .map(Transaction::convertToDocument).cache();
-
         recommendations.foreach(document -> {
-            document.append("storeId", 1);
+            document.append("organizationId", organizationId);
         });
 
+        writeToDatabase(recommendations, collectionOrganizationName);
+    }
 
-        MongoSpark.save(recommendations);
+
+    private static void writeToDatabase(JavaRDD<Document> recommendations, String collectionName) {
+        Map<String, String> writeOverrides = new HashMap<>();
+        writeOverrides.put("database", databaseName);
+        writeOverrides.put("collection", collectionName);
+        writeOverrides.put("writeConcern.w", "majority");
+        WriteConfig writeConfig = WriteConfig.create(javaSparkContext).withOptions(writeOverrides);
+
+        MongoSpark.save(recommendations, writeConfig);
         System.out.println("Saved recommendations in database");
-
     }
 
-    private static void createModelStore(JavaRDD<Transaction> transactions, int storeId, boolean testing) {
 
+
+
+
+    private static void writeToFile(String outputFile, Transaction transaction) throws IOException {
+        BufferedWriter writer = new BufferedWriter
+                (new OutputStreamWriter(new FileOutputStream(outputFile, true), StandardCharsets.ISO_8859_1));
+        ObjectMapper mapper = new ObjectMapper();
+        writer.append(mapper.writeValueAsString(transaction) + "\n");
+        writer.close();
     }
 
-    private static void createModelTimeOfDay(String inputEvents, String timeOfDay, boolean testing) {
-
-    }
-
-    public static class Person implements Serializable {
-        private String name;
-        private int age;
-
-        public String getName() {
-            return name;
-        }
-
-        public void setName(String name) {
-            this.name = name;
-        }
-
-        public int getAge() {
-            return age;
-        }
-
-        public void setAge(int age) {
-            this.age = age;
-        }
-    }
 }
