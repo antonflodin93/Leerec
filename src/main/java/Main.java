@@ -34,19 +34,11 @@ public class Main {
     private static String collectionOrganizationName = "userOrganizationRecommendations";
     private static String databaseName = "recommendationDB";
     private static int ALS_MAX_ITERATIONS = 5;
+    private static int NUMBER_RECOMMENDED_PRODUCTS = 10;
     private static double ALS_REG_PARAMETER = 0.01;
     private static String ALS_USER_COLUMN = "consumerId";
     private static String ALS_RATING_COLUMN = "rating";
     private static String ALS_ITEM_COLUMN = "productId";
-
-    public enum RecommendationType {
-        GENERAL,
-        ORGANIZATION,
-        WEEKDAY,
-        TIMEOFDAY
-    }
-
-
     private static String rootFolder;
 
     private static String rootLogFolder = "/Logs/v1";
@@ -238,46 +230,94 @@ public class Main {
 
         events.createOrReplaceTempView("events");
 
+        System.out.println("Building recommendations based on weekDay");
         long startWeekDay = currentTimeMillis();
         Dataset<Row> weekDays = sparkSession.sql("SELECT eventDateBlock.weekDay FROM events").distinct();
-
-        System.out.println("Building recommendations based on weekDay");
         weekDays.foreach(r -> {
             long weekDay = (long) r.get(0);
             Dataset<Row> transactionStores = sparkSession.sql("SELECT baseConsumer.consumerId, baseConsumer.rating, productId FROM events WHERE eventDateBlock.weekDay = " + weekDay);
-            createModelWeekDay(transactionStores, weekDay);
+            Dataset<Row> recommendations = createModel(transactionStores);
+            JavaRDD<Document> userRecommendations = recommendations.toJSON()
+                    .toJavaRDD()
+                    .map(Transaction::convertToDocument).cache();
+            userRecommendations.foreach(document -> {
+                document.append("weekDay", weekDay);
+                document.append("timestamp", new Timestamp(System.currentTimeMillis()).toString());
+            });
+
+            writeToDatabase(userRecommendations, collectionWeekDayName);
         });
         long endWeekDay = currentTimeMillis();
 
 
+        System.out.println("Building recommendations based on timeofday");
         long startTimeOfDay = currentTimeMillis();
         Dataset<Row> timeOfDays = sparkSession.sql("SELECT eventDateBlock.timeOfDay FROM events").distinct();
-
-        System.out.println("Building recommendations based on timeofday");
         timeOfDays.foreach(r -> {
             String timeOfDay = (String) r.get(0);
-            Dataset<Row> transactionStores = sparkSession.sql("SELECT baseConsumer.consumerId, baseConsumer.rating, productId FROM events WHERE eventDateBlock.timeOfDay = \"" + timeOfDay + "\"");
-            createModelTimeOfDay(transactionStores, timeOfDay);
+            Dataset<Row> transactionTimeOfDay = sparkSession.sql("SELECT baseConsumer.consumerId, baseConsumer.rating, productId FROM events WHERE eventDateBlock.timeOfDay = \"" + timeOfDay + "\"");
+            Dataset<Row> recommendations = createModel(transactionTimeOfDay);
+            JavaRDD<Document> userRecommendations = recommendations.toJSON()
+                    .toJavaRDD()
+                    .map(Transaction::convertToDocument).cache();
+            userRecommendations.foreach(document -> {
+                document.append("timeOfDay", timeOfDay);
+                document.append("timestamp", new Timestamp(System.currentTimeMillis()).toString());
+            });
+
+            writeToDatabase(userRecommendations, collectionTimeOfDayName);
         });
         long endTimeOfDay = currentTimeMillis();
 
 
-        long startOrg = currentTimeMillis();
-
         System.out.println("Building recommendations based on organizations");
+        long startOrg = currentTimeMillis();
         Dataset<Row> organizationIds = sparkSession.sql("SELECT DISTINCT organizationId FROM events");
-
         organizationIds.foreach(r -> {
             long organizationId = (long) r.get(0);
             Dataset<Row> transactionsOrganization = sparkSession.sql("SELECT baseConsumer.consumerId, baseConsumer.rating, productId FROM events WHERE organizationId = " + organizationId);
-            createModelOrganization(transactionsOrganization, organizationId);
+            Dataset<Row> recommendations = createModel(transactionsOrganization);
+            JavaRDD<Document> userRecommendations = recommendations.toJSON()
+                    .toJavaRDD()
+                    .map(Transaction::convertToDocument).cache();
+            userRecommendations.foreach(document -> {
+                document.append("organizationId", organizationId);
+                document.append("timestamp", new Timestamp(System.currentTimeMillis()).toString());
+            });
+            writeToDatabase(userRecommendations, collectionOrganizationName);
         });
         long endOrg = currentTimeMillis();
 
+        System.out.println("Building general recommendations");
         long allStart = currentTimeMillis();
         Dataset<Row> transactions = sparkSession.sql("SELECT baseConsumer.consumerId, baseConsumer.rating, productId FROM events");
+        Dataset<Row> recommendations = createModel(transactions);
+        JavaRDD<Document> userRecommendations = recommendations.toJSON()
+                .toJavaRDD()
+                .map(Transaction::convertToDocument).cache();
+        userRecommendations.foreach(document -> {
+            document.append("timestamp", new Timestamp(System.currentTimeMillis()).toString());
+        });
 
-        // Future work (to get accuracy)
+        writeToDatabase(userRecommendations, collectionGeneralRecommendations);
+
+        long allEnd = currentTimeMillis();
+
+
+        long allElapsedTime = allEnd - allStart;
+        long timeOfDayElapsedTime = endTimeOfDay - startTimeOfDay;
+        long orgElapsedTime = endOrg - startOrg;
+        long WeakDayElapsedTime = endWeekDay - startWeekDay;
+
+
+        System.out.println("[All transactions]: " + allElapsedTime + ", " + userRecommendations.count());
+        System.out.println("[Organization transactions]: " + orgElapsedTime + ", " + organizationIds.count());
+        System.out.println("[TimeOfDay transactions]: " + timeOfDayElapsedTime + ", " + timeOfDays.count());
+        System.out.println("[WeekDay transactions]: " + WeakDayElapsedTime + ", " + weekDays.count());
+    }
+
+    // Creates a model based on transactions and return the dataset with recommendations
+    private static Dataset<Row> createModel(Dataset<Row> transactions) {
         double[] splitPercantage = {0.8, 0.2};
         Dataset<Row> trainingDs = transactions.randomSplit(splitPercantage)[0];
         Dataset<Row> testDs = transactions.randomSplit(splitPercantage)[1];
@@ -291,146 +331,16 @@ public class Main {
                 .setItemCol(ALS_ITEM_COLUMN);
 
 
+        // Train a model from the dataset (this could be using whole dataset as well if needed)
         ALSModel model = als.fit(transactions);
 
-        Dataset<Row> predictions = model.transform(testDs);
-
-        // 10 item recommendations for each consumer
-        Dataset<Row> consumerRecommends = model.recommendForAllUsers(10);
-
-        long allEnd = currentTimeMillis();
-
-
-        long allElapsedTime = allEnd - allStart;
-        long timeOfDayElapsedTime = endTimeOfDay - startTimeOfDay;
-        long orgElapsedTime = endOrg - startOrg;
-        long WeakDayElapsedTime = endWeekDay - startWeekDay;
-
-
-        System.out.println("[All transactions]: " + allElapsedTime + ", " + consumerRecommends.count());
-        System.out.println("[Organization transactions]: " + orgElapsedTime + ", " + organizationIds.count());
-        System.out.println("[TimeOfDay transactions]: " + timeOfDayElapsedTime + ", " + timeOfDays.count());
-        System.out.println("[WeekDay transactions]: " + WeakDayElapsedTime + ", " + weekDays.count());
-
-        JavaRDD<Document> recommendations = consumerRecommends.toJSON()
-                .toJavaRDD()
-                .map(Transaction::convertToDocument).cache();
-
-
-        recommendations.foreach(document -> {
-            document.append("timestamp", new Timestamp(System.currentTimeMillis()).toString());
-        });
-
-        writeToDatabase(recommendations, collectionGeneralRecommendations);
-
-
-    }
-
-
-    private static void createModelOrganization(Dataset<Row> transactionsOrganization, long organizationId) {
-        double[] splitPercantage = {0.8, 0.2};
-        Dataset<Row> trainingDs = transactionsOrganization.randomSplit(splitPercantage)[0];
-        Dataset<Row> testDs = transactionsOrganization.randomSplit(splitPercantage)[1];
-
-
-        ALS als = new ALS()
-                .setMaxIter(ALS_MAX_ITERATIONS)
-                .setRegParam(ALS_REG_PARAMETER)
-                .setUserCol(ALS_USER_COLUMN)
-                .setRatingCol(ALS_RATING_COLUMN)
-                .setItemCol(ALS_ITEM_COLUMN);
-
-
-        // Train a model from the dataset (this could be using whole dataset as well if needed)
-        ALSModel model = als.fit(transactionsOrganization);
-
         // Future work, to measure accuracy for the model
-        Dataset<Row> predictions = model.transform(testDs);
+        //Dataset<Row> predictions = model.transform(testDs);
 
-        // 10 item recommendations for each consumer
-        Dataset<Row> consumerRecommends = model.recommendForAllUsers(10);
+        // Get recommendations for each consumer
+        Dataset<Row> consumerRecommends = model.recommendForAllUsers(NUMBER_RECOMMENDED_PRODUCTS);
 
-
-        JavaRDD<Document> recommendations = consumerRecommends.toJSON()
-                .toJavaRDD()
-                .map(Transaction::convertToDocument).cache();
-        recommendations.foreach(document -> {
-            // Maybee the cast is not needed (mongodb stores the value as NumberLong(1))
-            document.append("organizationId", (int) organizationId);
-            document.append("timestamp", new Timestamp(System.currentTimeMillis()).toString());
-        });
-
-        writeToDatabase(recommendations, collectionOrganizationName);
-    }
-
-    private static void createModelWeekDay(Dataset<Row> transactionsStores, long weekDay) {
-        double[] splitPercantage = {0.8, 0.2};
-        Dataset<Row> trainingDs = transactionsStores.randomSplit(splitPercantage)[0];
-        Dataset<Row> testDs = transactionsStores.randomSplit(splitPercantage)[1];
-
-
-        ALS als = new ALS()
-                .setMaxIter(ALS_MAX_ITERATIONS)
-                .setRegParam(ALS_REG_PARAMETER)
-                .setUserCol(ALS_USER_COLUMN)
-                .setRatingCol(ALS_RATING_COLUMN)
-                .setItemCol(ALS_ITEM_COLUMN);
-
-
-        // Train a model from the dataset (this could be using whole dataset as well if needed)
-        ALSModel model = als.fit(transactionsStores);
-
-
-        // Future work, to measure accuracy for the model
-        Dataset<Row> predictions = model.transform(testDs);
-
-        // 10 item recommendations for each consumer
-        Dataset<Row> consumerRecommends = model.recommendForAllUsers(10);
-
-        JavaRDD<Document> recommendations = consumerRecommends.toJSON()
-                .toJavaRDD()
-                .map(Transaction::convertToDocument).cache();
-        recommendations.foreach(document -> {
-            document.append("weekDay", weekDay);
-            document.append("timestamp", new Timestamp(System.currentTimeMillis()).toString());
-        });
-
-        writeToDatabase(recommendations, collectionWeekDayName);
-    }
-
-    private static void createModelTimeOfDay(Dataset<Row> transactionsStores, String timeOfDay) {
-        double[] splitPercantage = {0.8, 0.2};
-        Dataset<Row> trainingDs = transactionsStores.randomSplit(splitPercantage)[0];
-        Dataset<Row> testDs = transactionsStores.randomSplit(splitPercantage)[1];
-
-
-        ALS als = new ALS()
-                .setMaxIter(ALS_MAX_ITERATIONS)
-                .setRegParam(ALS_REG_PARAMETER)
-                .setUserCol(ALS_USER_COLUMN)
-                .setRatingCol(ALS_RATING_COLUMN)
-                .setItemCol(ALS_ITEM_COLUMN);
-
-
-        // Train a model from the dataset (this could be using whole dataset as well if needed)
-        ALSModel model = als.fit(transactionsStores);
-
-
-        // Future work, to measure accuracy for the model
-        Dataset<Row> predictions = model.transform(testDs);
-
-        // 10 item recommendations for each consumer
-        Dataset<Row> consumerRecommends = model.recommendForAllUsers(10);
-
-        JavaRDD<Document> recommendations = consumerRecommends.toJSON()
-                .toJavaRDD()
-                .map(Transaction::convertToDocument).cache();
-        recommendations.foreach(document -> {
-            document.append("timeOfDay", timeOfDay);
-            document.append("timestamp", new Timestamp(System.currentTimeMillis()).toString());
-        });
-
-        writeToDatabase(recommendations, collectionTimeOfDayName);
+        return consumerRecommends;
     }
 
 
