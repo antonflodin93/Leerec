@@ -16,6 +16,7 @@ import org.bson.Document;
 
 import java.io.*;
 import java.nio.charset.StandardCharsets;
+import java.sql.Timestamp;
 import java.util.*;
 
 import static java.lang.System.currentTimeMillis;
@@ -27,106 +28,85 @@ public class Main {
     private static JavaSparkContext javaSparkContext;
     private static SparkSession sparkSession;
     private static String FILE_TYPE = ".log";
-    private static String collectionRecommendations = "userRecommendations";
-    private static String collectionStoreName = "userStoreRecommendations";
+    private static String collectionGeneralRecommendations = "userGeneralRecommendations";
+    private static String collectionWeekDayName = "userWeekDayRecommendations";
+    private static String collectionTimeOfDayName = "userTimeOfDayRecommendations";
     private static String collectionOrganizationName = "userOrganizationRecommendations";
     private static String databaseName = "recommendationDB";
-    private static String homeFolder = "C:/Users/Jonna/OneDrive/Skrivbord/";
-    //private static String homeFolder = "C:/Users/Anton/Desktop/";
-    //private static String homeFolder = "/home/jonna/Desktop/";
+    private static int ALS_MAX_ITERATIONS = 5;
+    private static double ALS_REG_PARAMETER = 0.01;
+    private static String ALS_USER_COLUMN = "consumerId";
+    private static String ALS_RATING_COLUMN = "rating";
+    private static String ALS_ITEM_COLUMN = "productId";
+
+    public enum RecommendationType {
+        GENERAL,
+        ORGANIZATION,
+        WEEKDAY,
+        TIMEOFDAY
+    }
+
+
+    private static String rootFolder;
+
     private static String rootLogFolder = "/Logs/v1";
 
 
     public static void main(String[] args) throws IOException {
         Logger.getLogger("org").setLevel(Level.FATAL);
 
-        if (args[0].equals("--concat")) {
+
+        if (args[0].equals("-concat") && args.length == 3) {
             String year = args[1].substring(0, 2);
             String month = args[1].substring(2, 4);
-            String inputFolder = homeFolder + rootLogFolder + "/20" + year + "/" + month + "/*";
-            String outputFolder = homeFolder + "/" + args[1] + FILE_TYPE;
+            rootFolder = args[2];
+            String inputFolder = rootFolder + rootLogFolder + "/20" + year + "/" + month + "/*";
+            String outputFolder = rootFolder + "/" + args[1] + FILE_TYPE;
             concatFiles(inputFolder, outputFolder);
-        } else if (args[0].equals("--build")) {
-            build(args[1]);
-
-        } else if (args[0].equals("--parseDefault")) {
+        } else if (args[0].equals("-parse") && args.length == 3) {
+            rootFolder = args[2];
             parseCreateRatings(args[1]);
-        } else if (args[0].equals("--parse")) {
-            parseCreateRatings(args[1]);
-        } else if (args[0].equals("--model")) {
+        } else if (args[0].equals("-model") && args.length == 3) {
+            rootFolder = args[2];
             createModels(args[1]);
-        } else if (args[0].equals("--test")) {
-            test(homeFolder + args[1] + FILE_TYPE);
+        } else if (args[0].equals("-build") && args.length == 3) {
+            String year = args[1].substring(0, 2);
+            String month = args[1].substring(2, 4);
+            rootFolder = args[2];
+            String inputFolder = rootFolder + rootLogFolder + "/20" + year + "/" + month + "/*";
+            String outputFolder = rootFolder + "/" + args[1] + FILE_TYPE;
+            build(inputFolder, outputFolder);
+        } else{
+            System.out.println("Usage: ");
+            System.out.println("jarfile [--operation] [source folder/file] [rootfolder] where operation can be the following:\n");
+            System.out.println("-concat [source folder] [root folder] - Reads all log files from the given source folder (monthly) and outputs single file with the events. \n" +
+                    "Example: -concat \"1801\" \"C:/User/Desktop\", which concatenates all log files from January 2018.\n");
+            System.out.println("-parse [source file] [root folder] - Reads the events in the given source file, parse the " +
+                    "events and create a rating for each transaction, outputs to a file with the transactions, \n" +
+                    "Example: -parse \"1801\" \"C:/User/Desktop\", which create ratings for all transactions in January 2018.\n");
+            System.out.println("-model [source file] [root folder] - Create product recommendations based on the transactions in the source file, inserts the recommendations in MongoDB, \n" +
+                    "Example: -model \"1801ratings\" \"C:/User/Desktop\", which create recommendations for the transactions made in January 2018.\n");
+            System.out.println("-build [source folder] [root folder] - Performs all the steps: Concatenates, parsing and model, " +
+                    "Example: -build \"1801\" \"User/Desktop\"");
         }
-
-
     }
 
-    private static void test(String userEvents) {
-        conf = new SparkConf()
-                .setMaster("local[100]")
-                .setAppName("Parsing");
-
-        javaSparkContext = new JavaSparkContext(conf);
-
-        sparkSession = SparkSession
-                .builder()
-                .config(conf)
-                .getOrCreate();
-
-
-        JavaRDD<Transaction> transactions = javaSparkContext.textFile(userEvents)
-                .map(Transaction::parseLine);
-/*
-        // Get a list of organizations
-        List<Integer> organizationIdList = transactions
-                .map(t -> t.getOrganizationId())
-                .distinct()
-                .collect();
-
-        for (Integer organizationId : organizationIdList) {
-            // Create recommendations based on organizationIds
-            // createModelOrganization(transactions, organizationId, false);
-
-            JavaRDD<Integer> storeIds = transactions
-                    .filter(t -> t.getOrganizationId() == organizationId)
-                    .map(t -> t.getStoreId())
-                    .distinct();
-
-            // Create recommendations based on the organizationId and storeId
-            storeIds.foreach(storeId -> System.out.println(organizationId + ", " + storeId));
-
-            JavaRDD<String> timeOfDays = transactions
-                    .filter(t -> t.getOrganizationId() == organizationId)
-                    .map(t -> t.getEventDateBlock().getTimeOfDay())
-                    .distinct();
-
-            timeOfDays.foreach(timeOfDay -> System.out.println(timeOfDay));
-        }
-*/
-        modelTest(transactions);
-
-
-    }
-
-    private static void modelTest(JavaRDD<Transaction> transactions) {
-
-
-        // Apply a schema to an RDD of JavaBeans to get a DataFrame
-        Dataset<Row> peopleDF = sparkSession.createDataFrame(transactions, Transaction.class);
-        // Register the DataFrame as a temporary view
-        peopleDF.createOrReplaceTempView("people");
-
-        // SQL statements can be run by using the sql methods provided by spark
-        Dataset<Row> teenagersDF = sparkSession.sql("SELECT eventId FROM people");
-
-        teenagersDF.show(1);
-
+    /*
+     * Reads the events given a certain input file
+     * Create ratings
+     * Builds the models and recommendations
+     * Inserts into mongoDB
+     */
+    private static void build(String eventFolder, String outputFile) throws IOException {
+        concatFiles(eventFolder, outputFile);
+        String transactionRatingFileName = parseCreateRatings(outputFile);
+        createModels(transactionRatingFileName);
     }
 
     // Takes an input folder, reads all the events and concatenate them into a single file (monthly events)
     private static void concatFiles(String inputFolder, String outputFolder) throws IOException {
-        conf = new SparkConf().setMaster("local[100]")
+        System.out.println("Concatenating files...");
+        conf = new SparkConf().setMaster("local[*]")
                 .setAppName("Parsing");
         javaSparkContext = new JavaSparkContext(conf);
 
@@ -139,31 +119,22 @@ public class Main {
         for (String line : logJson) {
             writer.write(line + "\n");
         }
-
-        System.out.println("User events written to file.");
         writer.close();
-    }
 
-    /*
-     * Reads the events given a certain input file
-     * Create ratings
-     * Builds the model and recommendations
-     * Inserts into mongoDB
-     */
-    private static void build(String inputFile) {
-        String transactionRatingFileName = parseCreateRatings(inputFile);
-        createModels(transactionRatingFileName);
+        long end = currentTimeMillis();
+        System.out.println("User events written to file.");
+        System.out.println("Took: " + (end - start));
     }
 
     // Reads events from a file and create ratings from 1-5
     private static String parseCreateRatings(String inputArg) {
-        String inputFile = homeFolder + inputArg + FILE_TYPE;
-        String outputFile = homeFolder + inputArg + "ratings" + FILE_TYPE;
+        String inputFile = rootFolder + inputArg + FILE_TYPE;
+        String outputFile = rootFolder + inputArg + "ratings" + FILE_TYPE;
 
         System.out.println("Parsing JSON data from file...");
 
         conf = new SparkConf()
-                .setMaster("local[100]")
+                .setMaster("local[*]")
                 .setAppName("Parsing");
 
         javaSparkContext = new JavaSparkContext(conf);
@@ -173,10 +144,11 @@ public class Main {
                 .config(conf)
                 .getOrCreate();
 
+        long start = currentTimeMillis();
+
         JavaRDD<Transaction> transactions = javaSparkContext.textFile(inputFile)
                 .map(Transaction::parseLine)
                 .filter(t -> t.getBaseConsumer() != null && t.getProductId() != 0);
-
 
         // Get all transactions made by each consumer
         JavaPairRDD<Integer, Iterable<Transaction>> transactionsConsumers = transactions
@@ -224,29 +196,33 @@ public class Main {
                     maxAP = AP;
                 }
 
-
                 float RP = (float) AP / (float) maxAP;
-                rating = (int) Math.ceil(5 * RP);
+                rating = (int) Math.ceil(MAX_VALUE_RATING * RP);
             }
 
             transaction.getBaseConsumer().setRating(rating);
 
             writeToFile(outputFile, transaction);
+
         });
 
+        long end = currentTimeMillis();
 
+        System.out.println("Took: " + (end - start));
         System.out.println("Done parsing.");
         return outputFile;
     }
 
     // Create recommendations based on all transactions
     private static void createModels(String inputEvents) {
-        String eventsRating = homeFolder + inputEvents + FILE_TYPE;
+        System.out.println("Creating models...");
+        String eventsRating = rootFolder + inputEvents + FILE_TYPE;
 
         conf = new SparkConf()
-                .set("spark.mongodb.output.uri", "mongodb://127.0.0.1/" + databaseName + "." + collectionStoreName)
+                .set("spark.mongodb.output.uri", "mongodb://127.0.0.1/" + databaseName + "." + collectionGeneralRecommendations)
+                .set("spark.mongodb.output.uri", "mongodb://127.0.0.1/" + databaseName + "." + collectionWeekDayName)
+                .set("spark.mongodb.output.uri", "mongodb://127.0.0.1/" + databaseName + "." + collectionTimeOfDayName)
                 .set("spark.mongodb.output.uri", "mongodb://127.0.0.1/" + databaseName + "." + collectionOrganizationName)
-                .set("spark.mongodb.output.uri", "mongodb://127.0.0.1/" + databaseName + "." + collectionRecommendations)
                 .setMaster("local[*]")
                 .setAppName("Model");
 
@@ -262,76 +238,111 @@ public class Main {
 
         events.createOrReplaceTempView("events");
 
+        long startWeekDay = currentTimeMillis();
+        Dataset<Row> weekDays = sparkSession.sql("SELECT eventDateBlock.weekDay FROM events").distinct();
+
+        System.out.println("Building recommendations based on weekDay");
+        weekDays.foreach(r -> {
+            long weekDay = (long) r.get(0);
+            Dataset<Row> transactionStores = sparkSession.sql("SELECT baseConsumer.consumerId, baseConsumer.rating, productId FROM events WHERE eventDateBlock.weekDay = " + weekDay);
+            createModelWeekDay(transactionStores, weekDay);
+        });
+        long endWeekDay = currentTimeMillis();
+
+
+        long startTimeOfDay = currentTimeMillis();
+        Dataset<Row> timeOfDays = sparkSession.sql("SELECT eventDateBlock.timeOfDay FROM events").distinct();
+
+        System.out.println("Building recommendations based on timeofday");
+        timeOfDays.foreach(r -> {
+            String timeOfDay = (String) r.get(0);
+            Dataset<Row> transactionStores = sparkSession.sql("SELECT baseConsumer.consumerId, baseConsumer.rating, productId FROM events WHERE eventDateBlock.timeOfDay = \"" + timeOfDay + "\"");
+            createModelTimeOfDay(transactionStores, timeOfDay);
+        });
+        long endTimeOfDay = currentTimeMillis();
+
+
+        long startOrg = currentTimeMillis();
+
+        System.out.println("Building recommendations based on organizations");
         Dataset<Row> organizationIds = sparkSession.sql("SELECT DISTINCT organizationId FROM events");
 
-        System.out.println("Building recommendations based on organizations:");
         organizationIds.foreach(r -> {
             long organizationId = (long) r.get(0);
             Dataset<Row> transactionsOrganization = sparkSession.sql("SELECT baseConsumer.consumerId, baseConsumer.rating, productId FROM events WHERE organizationId = " + organizationId);
             createModelOrganization(transactionsOrganization, organizationId);
         });
+        long endOrg = currentTimeMillis();
 
-        /*
-
-        long start = currentTimeMillis();
+        long allStart = currentTimeMillis();
         Dataset<Row> transactions = sparkSession.sql("SELECT baseConsumer.consumerId, baseConsumer.rating, productId FROM events");
 
+        // Future work (to get accuracy)
         double[] splitPercantage = {0.8, 0.2};
         Dataset<Row> trainingDs = transactions.randomSplit(splitPercantage)[0];
         Dataset<Row> testDs = transactions.randomSplit(splitPercantage)[1];
 
 
         ALS als = new ALS()
-                .setMaxIter(5)
-                .setRegParam(0.01)
-                .setUserCol("consumerId")
-                .setRatingCol("rating")
-                .setItemCol("productId");
+                .setMaxIter(ALS_MAX_ITERATIONS)
+                .setRegParam(ALS_REG_PARAMETER)
+                .setUserCol(ALS_USER_COLUMN)
+                .setRatingCol(ALS_RATING_COLUMN)
+                .setItemCol(ALS_ITEM_COLUMN);
 
 
-        // Train a model from the dataset
-        ALSModel model = als.fit(trainingDs);
+        ALSModel model = als.fit(transactions);
 
         Dataset<Row> predictions = model.transform(testDs);
 
         // 10 item recommendations for each consumer
         Dataset<Row> consumerRecommends = model.recommendForAllUsers(10);
 
+        long allEnd = currentTimeMillis();
 
-        System.out.println("num of users: " + consumerRecommends.count());
 
-        long end = currentTimeMillis();
+        long allElapsedTime = allEnd - allStart;
+        long timeOfDayElapsedTime = endTimeOfDay - startTimeOfDay;
+        long orgElapsedTime = endOrg - startOrg;
+        long WeakDayElapsedTime = endWeekDay - startWeekDay;
 
-        long elapsedTime = end - start;
 
-        System.out.println("Took " + elapsedTime);
+        System.out.println("[All transactions]: " + allElapsedTime + ", " + consumerRecommends.count());
+        System.out.println("[Organization transactions]: " + orgElapsedTime + ", " + organizationIds.count());
+        System.out.println("[TimeOfDay transactions]: " + timeOfDayElapsedTime + ", " + timeOfDays.count());
+        System.out.println("[WeekDay transactions]: " + WeakDayElapsedTime + ", " + weekDays.count());
 
         JavaRDD<Document> recommendations = consumerRecommends.toJSON()
                 .toJavaRDD()
                 .map(Transaction::convertToDocument).cache();
 
-*/
+
+        recommendations.foreach(document -> {
+            document.append("timestamp", new Timestamp(System.currentTimeMillis()).toString());
+        });
+
+        writeToDatabase(recommendations, collectionGeneralRecommendations);
+
 
     }
 
-    private static void createModelOrganization(Dataset<Row> transactionsOrganization, long organizationId) {
-        long start = currentTimeMillis();
 
+    private static void createModelOrganization(Dataset<Row> transactionsOrganization, long organizationId) {
         double[] splitPercantage = {0.8, 0.2};
         Dataset<Row> trainingDs = transactionsOrganization.randomSplit(splitPercantage)[0];
         Dataset<Row> testDs = transactionsOrganization.randomSplit(splitPercantage)[1];
 
 
         ALS als = new ALS()
-                .setMaxIter(5)
-                .setRegParam(0.01)
-                .setUserCol("consumerId")
-                .setRatingCol("rating")
-                .setItemCol("productId");
+                .setMaxIter(ALS_MAX_ITERATIONS)
+                .setRegParam(ALS_REG_PARAMETER)
+                .setUserCol(ALS_USER_COLUMN)
+                .setRatingCol(ALS_RATING_COLUMN)
+                .setItemCol(ALS_ITEM_COLUMN);
 
 
         // Train a model from the dataset (this could be using whole dataset as well if needed)
-        ALSModel model = als.fit(trainingDs);
+        ALSModel model = als.fit(transactionsOrganization);
 
         // Future work, to measure accuracy for the model
         Dataset<Row> predictions = model.transform(testDs);
@@ -340,66 +351,86 @@ public class Main {
         Dataset<Row> consumerRecommends = model.recommendForAllUsers(10);
 
 
-        System.out.println("num of users: " + consumerRecommends.count());
-
-        long end = currentTimeMillis();
-
-        long elapsedTime = end - start;
-
-        System.out.println("[createModelOrganization] - elapsed time " + elapsedTime);
-
         JavaRDD<Document> recommendations = consumerRecommends.toJSON()
                 .toJavaRDD()
                 .map(Transaction::convertToDocument).cache();
         recommendations.foreach(document -> {
             // Maybee the cast is not needed (mongodb stores the value as NumberLong(1))
             document.append("organizationId", (int) organizationId);
+            document.append("timestamp", new Timestamp(System.currentTimeMillis()).toString());
         });
 
         writeToDatabase(recommendations, collectionOrganizationName);
     }
 
-    private static void createModelStore(Dataset<Row> transactionsOrganization, int organizationId) {
-        long start = currentTimeMillis();
-
+    private static void createModelWeekDay(Dataset<Row> transactionsStores, long weekDay) {
         double[] splitPercantage = {0.8, 0.2};
-        Dataset<Row> trainingDs = transactionsOrganization.randomSplit(splitPercantage)[0];
-        Dataset<Row> testDs = transactionsOrganization.randomSplit(splitPercantage)[1];
+        Dataset<Row> trainingDs = transactionsStores.randomSplit(splitPercantage)[0];
+        Dataset<Row> testDs = transactionsStores.randomSplit(splitPercantage)[1];
 
 
         ALS als = new ALS()
-                .setMaxIter(5)
-                .setRegParam(0.01)
-                .setUserCol("consumerId")
-                .setRatingCol("rating")
-                .setItemCol("productId");
+                .setMaxIter(ALS_MAX_ITERATIONS)
+                .setRegParam(ALS_REG_PARAMETER)
+                .setUserCol(ALS_USER_COLUMN)
+                .setRatingCol(ALS_RATING_COLUMN)
+                .setItemCol(ALS_ITEM_COLUMN);
 
 
-        // Train a model from the dataset
-        ALSModel model = als.fit(trainingDs);
+        // Train a model from the dataset (this could be using whole dataset as well if needed)
+        ALSModel model = als.fit(transactionsStores);
 
+
+        // Future work, to measure accuracy for the model
         Dataset<Row> predictions = model.transform(testDs);
 
         // 10 item recommendations for each consumer
         Dataset<Row> consumerRecommends = model.recommendForAllUsers(10);
 
+        JavaRDD<Document> recommendations = consumerRecommends.toJSON()
+                .toJavaRDD()
+                .map(Transaction::convertToDocument).cache();
+        recommendations.foreach(document -> {
+            document.append("weekDay", weekDay);
+            document.append("timestamp", new Timestamp(System.currentTimeMillis()).toString());
+        });
 
-        System.out.println("num of users: " + consumerRecommends.count());
+        writeToDatabase(recommendations, collectionWeekDayName);
+    }
 
-        long end = currentTimeMillis();
+    private static void createModelTimeOfDay(Dataset<Row> transactionsStores, String timeOfDay) {
+        double[] splitPercantage = {0.8, 0.2};
+        Dataset<Row> trainingDs = transactionsStores.randomSplit(splitPercantage)[0];
+        Dataset<Row> testDs = transactionsStores.randomSplit(splitPercantage)[1];
 
-        long elapsedTime = end - start;
 
-        System.out.println("[createModelOrganization] - elapsed time " + elapsedTime);
+        ALS als = new ALS()
+                .setMaxIter(ALS_MAX_ITERATIONS)
+                .setRegParam(ALS_REG_PARAMETER)
+                .setUserCol(ALS_USER_COLUMN)
+                .setRatingCol(ALS_RATING_COLUMN)
+                .setItemCol(ALS_ITEM_COLUMN);
+
+
+        // Train a model from the dataset (this could be using whole dataset as well if needed)
+        ALSModel model = als.fit(transactionsStores);
+
+
+        // Future work, to measure accuracy for the model
+        Dataset<Row> predictions = model.transform(testDs);
+
+        // 10 item recommendations for each consumer
+        Dataset<Row> consumerRecommends = model.recommendForAllUsers(10);
 
         JavaRDD<Document> recommendations = consumerRecommends.toJSON()
                 .toJavaRDD()
                 .map(Transaction::convertToDocument).cache();
         recommendations.foreach(document -> {
-            document.append("organizationId", organizationId);
+            document.append("timeOfDay", timeOfDay);
+            document.append("timestamp", new Timestamp(System.currentTimeMillis()).toString());
         });
 
-        writeToDatabase(recommendations, collectionOrganizationName);
+        writeToDatabase(recommendations, collectionTimeOfDayName);
     }
 
 
@@ -413,9 +444,6 @@ public class Main {
         MongoSpark.save(recommendations, writeConfig);
         System.out.println("Saved recommendations in database");
     }
-
-
-
 
 
     private static void writeToFile(String outputFile, Transaction transaction) throws IOException {
