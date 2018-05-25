@@ -40,6 +40,7 @@ public class Main {
     private static String ALS_RATING_COLUMN = "rating";
     private static String ALS_ITEM_COLUMN = "productId";
     private static String rootFolder;
+    private static String parsedFile;
 
     private static String rootLogFolder = "/Logs/v1";
 
@@ -61,13 +62,6 @@ public class Main {
         } else if (args[0].equals("-model") && args.length == 3) {
             rootFolder = args[2];
             createModels(args[1]);
-        } else if (args[0].equals("-build") && args.length == 3) {
-            String year = args[1].substring(0, 2);
-            String month = args[1].substring(2, 4);
-            rootFolder = args[2];
-            String inputFolder = rootFolder + rootLogFolder + "/20" + year + "/" + month + "/*";
-            String outputFolder = rootFolder + "/" + args[1] + FILE_TYPE;
-            build(inputFolder, outputFolder);
         } else{
             System.out.println("Usage: ");
             System.out.println("jarfile [--operation] [source folder/file] [rootfolder] where operation can be the following:\n");
@@ -78,26 +72,12 @@ public class Main {
                     "Example: -parse \"1801\" \"C:/User/Desktop\", which create ratings for all transactions in January 2018.\n");
             System.out.println("-model [source file] [root folder] - Create product recommendations based on the transactions in the source file, inserts the recommendations in MongoDB, \n" +
                     "Example: -model \"1801ratings\" \"C:/User/Desktop\", which create recommendations for the transactions made in January 2018.\n");
-            System.out.println("-build [source folder] [root folder] - Performs all the steps: Concatenates, parsing and model, " +
-                    "Example: -build \"1801\" \"User/Desktop\"");
         }
-    }
-
-    /*
-     * Reads the events given a certain input file
-     * Create ratings
-     * Builds the models and recommendations
-     * Inserts into mongoDB
-     */
-    private static void build(String eventFolder, String outputFile) throws IOException {
-        concatFiles(eventFolder, outputFile);
-        String transactionRatingFileName = parseCreateRatings(outputFile);
-        createModels(transactionRatingFileName);
     }
 
     // Takes an input folder, reads all the events and concatenate them into a single file (monthly events)
     private static void concatFiles(String inputFolder, String outputFolder) throws IOException {
-        System.out.println("Concatenating files...");
+        System.out.println("Concatenating files from " + inputFolder);
         conf = new SparkConf().setMaster("local[*]")
                 .setAppName("Parsing");
         javaSparkContext = new JavaSparkContext(conf);
@@ -115,15 +95,16 @@ public class Main {
 
         long end = currentTimeMillis();
         System.out.println("User events written to file.");
-        System.out.println("Took: " + (end - start));
+        System.out.println("Execution time: " + (end - start));
+        javaSparkContext.close();
     }
 
     // Reads events from a file and create ratings from 1-5
-    private static String parseCreateRatings(String inputArg) {
+    private static void parseCreateRatings(String inputArg) {
         String inputFile = rootFolder + inputArg + FILE_TYPE;
-        String outputFile = rootFolder + inputArg + "ratings" + FILE_TYPE;
+        parsedFile = rootFolder + inputArg + "ratings" + FILE_TYPE;
 
-        System.out.println("Parsing JSON data from file...");
+        System.out.println("Parsing JSON data from file " + inputArg);
 
         conf = new SparkConf()
                 .setMaster("local[*]")
@@ -194,20 +175,20 @@ public class Main {
 
             transaction.getBaseConsumer().setRating(rating);
 
-            writeToFile(outputFile, transaction);
+            writeToFile(parsedFile, transaction);
 
         });
 
         long end = currentTimeMillis();
 
-        System.out.println("Took: " + (end - start));
+        System.out.println("Execution time: " + (end - start));
         System.out.println("Done parsing.");
-        return outputFile;
+        javaSparkContext.close();
     }
 
     // Create recommendations based on all transactions
     private static void createModels(String inputEvents) {
-        System.out.println("Creating models...");
+        System.out.println("Creating models from " + inputEvents);
         String eventsRating = rootFolder + inputEvents + FILE_TYPE;
 
         conf = new SparkConf()
@@ -314,6 +295,7 @@ public class Main {
         System.out.println("[Organization transactions]: " + orgElapsedTime + ", " + organizationIds.count());
         System.out.println("[TimeOfDay transactions]: " + timeOfDayElapsedTime + ", " + timeOfDays.count());
         System.out.println("[WeekDay transactions]: " + WeakDayElapsedTime + ", " + weekDays.count());
+        javaSparkContext.close();
     }
 
     // Creates a model based on transactions and return the dataset with recommendations
